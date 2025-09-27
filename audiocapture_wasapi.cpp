@@ -22,7 +22,14 @@ extern const char* ErrorString(HRESULT id);
 
 static constexpr int REFPERSEC = 10000000;
 
-static Array<RCPtr<IMMDevice>> Devices;
+// マイクとシステム音デバイスを区別できるように、構造体として保持する
+struct AudioDevice
+{
+    RCPtr<IMMDevice> Device;
+    EDataFlow Flow; // eRender (出力/システム音) または eCapture (入力/マイク)
+    bool IsDefault = false; // デフォルトデバイスかどうかのフラグ
+};
+static Array<AudioDevice> Devices;
 
 class AudioCapture_WASAPI : public IAudioCapture
 {
@@ -31,7 +38,7 @@ class AudioCapture_WASAPI : public IAudioCapture
     RCPtr<IAudioClient> Client;
     RCPtr<IAudioCaptureClient> CaptureClient;
 
-    RCPtr<IAudioClient> PlaybackClient;
+    RCPtr<IAudioClient> PlaybackClient; // システム音キャプチャでのみ使用
 
     WAVEFORMATEXTENSIBLE* Format = nullptr;
     uint BufferSize = 0;
@@ -72,7 +79,7 @@ class AudioCapture_WASAPI : public IAudioCapture
                     ScopeLock lock(RingLock);
                     uint avail = RingSize - (RingWrite - RingRead);
                     if (bytes > avail)
-                        RingRead += bytes-avail;
+                        RingRead += bytes - avail;
 
                     RingTimePos = RingWrite;
                     RingTimeValue = time;
@@ -115,34 +122,47 @@ public:
         // init COM
         CHECK(CoInitializeEx(NULL, COINIT_MULTITHREADED));
 
-        auto device = Devices[cfg.AudioOutputIndex];
-   
-        // initialize dummy playback client to keep the device running
-        WAVEFORMATEX* outFormat = nullptr;
-        uint outBufferSize = 0;
-        BYTE* outBuffer;
-        CHECK(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, PlaybackClient));
-        CHECK(PlaybackClient->GetMixFormat(&outFormat));
-        CHECK(PlaybackClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, duration, 0, outFormat, NULL));
-        CHECK(PlaybackClient->GetBufferSize(&outBufferSize));
-        RCPtr<IAudioRenderClient> renderClient;
-        CHECK(PlaybackClient->GetService(__uuidof(IAudioRenderClient), renderClient));
-        CHECK(renderClient->GetBuffer(outBufferSize, &outBuffer));
-        memset(outBuffer, 0, (size_t)outBufferSize * outFormat->nBlockAlign);
-        CHECK(PlaybackClient->Start());
+        auto& device_info = Devices[cfg.AudioOutputIndex];
+        auto device = device_info.Device;
+        const bool is_loopback = (device_info.Flow == EDataFlow::eRender); // eRenderならシステム音キャプチャ
 
-        //  initialize client for loopback recording
+        // システム音キャプチャの場合のみ、ダミーの再生クライアントを初期化する
+        if (is_loopback)
+        {
+            // initialize dummy playback client to keep the device running
+            WAVEFORMATEX* outFormat = nullptr;
+            uint outBufferSize = 0;
+            BYTE* outBuffer;
+            CHECK(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, PlaybackClient));
+            CHECK(PlaybackClient->GetMixFormat(&outFormat));
+            CHECK(PlaybackClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, duration, 0, outFormat, NULL));
+            CHECK(PlaybackClient->GetBufferSize(&outBufferSize));
+            RCPtr<IAudioRenderClient> renderClient;
+            CHECK(PlaybackClient->GetService(__uuidof(IAudioRenderClient), renderClient));
+            CHECK(renderClient->GetBuffer(outBufferSize, &outBuffer));
+            memset(outBuffer, 0, (size_t)outBufferSize * outFormat->nBlockAlign);
+            CHECK(PlaybackClient->Start());
+        }
+
+        // initialize client for capture (loopback for render, direct for capture)
         CHECK(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, Client));
         CHECK(Client->GetMixFormat((WAVEFORMATEX**)&Format));
 
         // TODO? support for non-float samples and other channel configs than stereo
         ASSERT(Format->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE && Format->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
-        
+
         BytesPerSample = Format->Format.nChannels * Format->Format.wBitsPerSample / 8;
         RingSize = Format->Format.nSamplesPerSec * BytesPerSample; // 1 second for now
         Ring = new uint8[RingSize];
 
-        CHECK(Client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, duration, 0, (WAVEFORMATEX*)Format, NULL));
+        // デバイスの種別に応じてAUDCLNT_STREAMFLAGSを切り替える
+        DWORD streamFlags = 0;
+        if (is_loopback)
+        {
+            streamFlags = AUDCLNT_STREAMFLAGS_LOOPBACK;
+        }
+
+        CHECK(Client->Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags, duration, 0, (WAVEFORMATEX*)Format, NULL));
         CHECK(Client->GetBufferSize(&BufferSize));
         CHECK(Client->GetService(__uuidof(IAudioCaptureClient), CaptureClient));
 
@@ -155,11 +175,18 @@ public:
     {
         delete CaptureThread;
         Client->Stop();
-        PlaybackClient->Stop();
+
+        // PlaybackClientはシステム音キャプチャの場合にのみ存在する
+        // [修正]: 明示的なキャストを使用し、NULLでないことを確認する
+        if ((IAudioClient*)PlaybackClient != NULL)
+        {
+            PlaybackClient->Stop();
+            PlaybackClient.Clear();
+        }
 
         CaptureClient.Clear();
         Client.Clear();
-        PlaybackClient.Clear();
+
 
         delete[] Ring;
 
@@ -178,7 +205,7 @@ public:
         };
     }
 
-    uint Read(uint8* dest, uint size, double &time) override
+    uint Read(uint8* dest, uint size, double& time) override
     {
         ScopeLock lock(RingLock);
         time = RingTimeValue + ((double)RingRead - RingTimePos) / (double)(BytesPerSample * Format->Format.nSamplesPerSec);
@@ -217,49 +244,92 @@ void InitAudioCapture()
     RCPtr<IMMDeviceEnumerator> enumerator;
     CHECK(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), enumerator));
 
-    // Get default endpoint
-    RCPtr<IMMDevice> defltdev;
-    CHECK(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, defltdev));
-    Devices += defltdev;
+    // eRender (出力) デバイスを列挙
+    // Get default endpoint (eRender for system audio)
+    RCPtr<IMMDevice> defltdev_render;
+    CHECK(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, defltdev_render));
+    // デフォルト出力デバイスをリストに追加
+    Devices += AudioDevice{ defltdev_render, EDataFlow::eRender, true };
 
-    // Enumerate all other endpoints
-    RCPtr<IMMDeviceCollection> collection;
-    CHECK(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, collection));
-    uint count = 0;
-    CHECK(collection->GetCount(&count));
-    for (uint i = 0; i < count; i++)
+    // Enumerate all other endpoints (eRender)
+    RCPtr<IMMDeviceCollection> collection_render;
+    CHECK(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, collection_render));
+    uint count_render = 0;
+    CHECK(collection_render->GetCount(&count_render));
+    for (uint i = 0; i < count_render; i++)
     {
         RCPtr<IMMDevice> dev;
-        CHECK(collection->Item(i, dev));
-        Devices += dev;
+        CHECK(collection_render->Item(i, dev));
+        Devices += AudioDevice{ dev, EDataFlow::eRender, false };
+    }
+
+    // eCapture (入力) デバイスを列挙
+    // Get default endpoint (eCapture for microphone)
+    RCPtr<IMMDevice> defltdev_capture;
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, defltdev_capture)))
+    {
+        // デフォルト入力デバイスをリストに追加
+        Devices += AudioDevice{ defltdev_capture, EDataFlow::eCapture, true };
+    }
+
+    // Enumerate all other endpoints (eCapture)
+    RCPtr<IMMDeviceCollection> collection_capture;
+    CHECK(enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, collection_capture));
+    uint count_capture = 0;
+    CHECK(collection_capture->GetCount(&count_capture));
+    for (uint i = 0; i < count_capture; i++)
+    {
+        RCPtr<IMMDevice> dev;
+        CHECK(collection_capture->Item(i, dev));
+        Devices += AudioDevice{ dev, EDataFlow::eCapture, false };
     }
 }
 
-void GetAudioDevices(Array<String> &into)
+void GetAudioDevices(Array<String>& into)
 {
     into.Clear();
-    bool dflt = true;
-    for (auto device : Devices)
+
+    for (auto& device_info : Devices)
     {
+        auto device = device_info.Device;
+        EDataFlow flow = device_info.Flow;
+
+        if (device_info.IsDefault)
+        {
+            // デフォルトデバイスはフレンドリーネームを取得せず、固定名を使用
+            if (flow == EDataFlow::eRender)
+                into += "Default output (System Sound)";
+            else // eCapture
+                into += "Default input (Microphone)";
+
+            continue;
+        }
+
         LPWSTR id = nullptr;
         device->GetId(&id);
 
         RCPtr<IPropertyStore> store;
-        device->OpenPropertyStore(STGM_READ, store);
-         
+        if (FAILED(device->OpenPropertyStore(STGM_READ, store)))
+        {
+            CoTaskMemFree(id);
+            continue;
+        }
+
         PROPVARIANT varName;
         PropVariantInit(&varName);
-        store->GetValue(PKEY_Device_FriendlyName, &varName);
-        if (dflt)
+        if (FAILED(store->GetValue(PKEY_Device_FriendlyName, &varName)))
         {
-            into += "Default output";
-            dflt = false;
+            PropVariantClear(&varName);
+            CoTaskMemFree(id);
+            continue;
         }
-        else
-            into += varName.pwszVal;
+
+        String prefix = (flow == EDataFlow::eRender) ? "Output: " : "Input: ";
+        into += prefix + varName.pwszVal;
 
         PropVariantClear(&varName);
-    }      
+        CoTaskMemFree(id);
+    }
 }
 
-IAudioCapture* CreateAudioCaptureWASAPI(const CaptureConfig &config) { return new AudioCapture_WASAPI(config); }
+IAudioCapture* CreateAudioCaptureWASAPI(const CaptureConfig& config) { return new AudioCapture_WASAPI(config); }
